@@ -28,12 +28,6 @@ async def get_session():
                 )
     return _session
 
-async def close():
-    global _session
-    if _session and not _session.closed:
-        await _session.close()
-        _session = None
-
 async def _api(hdrs, method, path, retries=3, **kw):
     s = await get_session()
     backoff = 1.0
@@ -41,8 +35,7 @@ async def _api(hdrs, method, path, retries=3, **kw):
         try:
             async with s.request(method, f"{API}{path}", headers=hdrs, **kw) as r:
                 if r.status == 429:
-                    retry = float((await r.json()).get("retry_after", 5))
-                    await asyncio.sleep(retry)
+                    await asyncio.sleep(float((await r.json()).get("retry_after", 5)))
                     continue
                 if r.status >= 500 and attempt < retries - 1:
                     await asyncio.sleep(backoff)
@@ -66,14 +59,13 @@ async def check_token(token: str):
         return res
     return None
 
-async def run_pass(token: str, log=print):
+async def run_pass(token: str):
     hdrs = make_headers(token)
     done, errors = [], []
     me = await _api(hdrs, "GET", "/users/@me")
     if "error" in me:
         return done, ["Token invalid or network error."]
 
-    log(f"Logged in as {me.get('username', 'Unknown')}")
     quests = await _api(hdrs, "GET", "/quests/@me")
     if not isinstance(quests, list):
         err = quests.get("message", "Bad quest response") if isinstance(quests, dict) else "Bad quest response"
@@ -100,6 +92,5 @@ async def run_pass(token: str, log=print):
             errors.append(f"Failed to claim {q.get('name', qid)}")
         else:
             done.append(q.get("name", qid))
-            log(f"[done] {q.get('name', qid)}")
         await asyncio.sleep(random.uniform(2, 4))
     return done, errors
