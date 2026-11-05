@@ -5,7 +5,6 @@ _pool = None
 _lock = asyncio.Lock()
 
 async def init():
-    global _pool
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
@@ -67,9 +66,3 @@ async def all_enabled():
     db = await _conn()
     async with db.execute("SELECT discord_id, user_token FROM users WHERE enabled=1") as cur:
         return await cur.fetchall()
-
-async def close():
-    global _pool
-    if _pool:
-        await _pool.close()
-        _pool = None
