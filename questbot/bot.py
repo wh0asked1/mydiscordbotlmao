@@ -1,4 +1,4 @@
-import os, asyncio, logging
+import os, asyncio, logging, time, random
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -6,13 +6,22 @@ import db, quest_engine
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("questbot")
 
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+active_tasks = {}
+
+C_OK = discord.Color.green()
+C_ERR = discord.Color.red()
+C_INFO = discord.Color.blue()
+C_WAIT = discord.Color.gold()
+
+def E(title, desc="", color=C_INFO, footer=None):
+    e = discord.Embed(title=title, description=desc, color=color, timestamp=discord.utils.utcnow())
+    if footer: e.set_footer(text=footer)
+    return e
 
 @bot.event
 async def on_ready():
@@ -21,104 +30,123 @@ async def on_ready():
     log.info(f"logged in as {bot.user}")
     auto_loop.start()
 
+async def _run_user(discord_id: str, token: str, inter=None):
+    await db.set_status(discord_id, "running", int(time.time()))
+    try:
+        done, errors = await quest_engine.run_pass(token)
+        if errors:
+            await db.set_status(discord_id, "error", int(time.time()))
+            if inter:
+                desc = "\n".join(f"❌ {e}" for e in errors)
+                if done: desc += "\n\n" + "\n".join(f"✅ {d}" for d in done)
+                await inter.followup.send(embed=E("⚠️ Partial Pass", desc, C_ERR), ephemeral=True)
+        else:
+            await db.set_status(discord_id, "idle", int(time.time()))
+            if inter:
+                desc = "\n".join(f"✅ {d}" for d in done) if done else "Nothing new to claim."
+                await inter.followup.send(embed=E("✅ Pass Complete", desc, C_OK), ephemeral=True)
+    except asyncio.CancelledError:
+        await db.set_status(discord_id, "idle")
+        if inter:
+            try: await inter.followup.send(embed=E("🛑 Stopped", "Pass cancelled by user.", C_WAIT), ephemeral=True)
+            except Exception: pass
+        raise
+    except Exception as e:
+        log.exception(e)
+        await db.set_status(discord_id, "error", int(time.time()))
+        if inter:
+            try: await inter.followup.send(embed=E("❌ Crash", str(e), C_ERR), ephemeral=True)
+            except Exception: pass
+    finally:
+        active_tasks.pop(discord_id, None)
+
 @tasks.loop(minutes=30)
 async def auto_loop():
+    sem = asyncio.Semaphore(3)
     rows = await db.all_enabled()
-    log.info(f"[auto] {len(rows)} user(s)")
-    for discord_id, token in rows:
-        try:
-            await quest_engine.run_pass(token, log=lambda m: log.info(f"[{discord_id}] {m}"))
-            await db.mark_run(discord_id)
-        except Exception as e:
-            log.exception(f"[{discord_id}] {e}")
-        await asyncio.sleep(5)
+    async def _one(discord_id, token):
+        async with sem:
+            if discord_id in active_tasks: return
+            u = await db.get_user(discord_id)
+            if u and u["status"] == "running": return
+            await asyncio.sleep(random.uniform(1, 10))
+            task = asyncio.create_task(_run_user(discord_id, token))
+            active_tasks[discord_id] = task
+    await asyncio.gather(*(_one(d, t) for d, t in rows), return_exceptions=True)
 
 @auto_loop.before_loop
 async def before():
     await bot.wait_until_ready()
 
-# --- commands ---
+# --- Commands ---
 
-@bot.tree.command(name="settoken", description="Save your Discord user token for quest farming")
+@bot.tree.command(name="ping", description="Check bot latency")
+async def ping(inter: discord.Interaction):
+    await inter.response.send_message(embed=E("🏓 Pong", f"Latency: **{round(bot.latency*1000)}ms**", C_INFO), ephemeral=True)
+
+@bot.tree.command(name="settoken", description="Save your Discord user token")
 async def settoken(inter: discord.Interaction, token: str):
     await inter.response.defer(ephemeral=True)
     me = await quest_engine.check_token(token)
     if not me:
-        return await inter.followup.send("❌ token invalid or dead.", ephemeral=True)
+        return await inter.followup.send(embed=E("❌ Invalid Token", "Check the token and try again.", C_ERR), ephemeral=True)
     await db.set_token(str(inter.user.id), token)
-    # scrub the token from channel
-    try:
-        await inter.channel.delete_messages([inter.message]) if inter.message else None
-    except Exception:
-        pass
-    await inter.followup.send(
-        f"✅ saved for **{me.get('username')}**. "
-        f"⚠️ delete your `!settoken` message — the token is in your chat history.",
-        ephemeral=True,
-    )
+    e = E("✅ Token Saved", f"Bound to **{me.get('username')}**", C_OK, "Delete your command message if it was public.")
+    await inter.followup.send(embed=e, ephemeral=True)
 
-@bot.tree.command(name="runtoken", description="Run a quest pass right now")
-async def runtoken(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True)
-    token, enabled = await db.get_token(str(inter.user.id))
-    if not token or not enabled:
-        return await inter.followup.send("❌ no token saved. use `/settoken`.", ephemeral=True)
-    await inter.followup.send("⏳ pass started…", ephemeral=True)
-    done = await quest_engine.run_pass(token, log=lambda m: log.info(f"[{inter.user.id}] {m}"))
-    if not done:
-        await inter.followup.send("✅ pass complete — nothing new to claim.", ephemeral=True)
-    else:
-        await inter.followup.send(
-            "✅ claimed:\n" + "\n".join(f"• {n}" for n in done),
-            ephemeral=True,
-        )
+@bot.tree.command(name="token", description="Check your saved token status")
+async def token_cmd(inter: discord.Interaction):
+    u = await db.get_user(str(inter.user.id))
+    if not u:
+        return await inter.response.send_message(embed=E("❌ No Token", "Run `/settoken` first.", C_ERR), ephemeral=True)
+    me = await quest_engine.check_token(u["user_token"])
+    icon = "🟢" if u["enabled"] else "🔴"
+    e = E("🔑 Token Status", color=C_INFO)
+    e.add_field(name="Account", value=f"`{me.get('username') if me else 'Dead'}`", inline=False)
+    e.add_field(name="Auto-Farm", value=f"{icon} {'Enabled' if u['enabled'] else 'Disabled'}", inline=True)
+    e.add_field(name="State", value=f"`{u['status'].upper()}`", inline=True)
+    await inter.response.send_message(embed=e, ephemeral=True)
 
-@bot.tree.command(name="mytoken", description="Check status")
-async def mytoken(inter: discord.Interaction):
-    token, enabled = await db.get_token(str(inter.user.id))
-    if not token:
-        return await inter.response.send_message("❌ none saved.", ephemeral=True)
-    me = await quest_engine.check_token(token)
-    if not me:
-        return await inter.response.send_message("❌ saved token is dead.", ephemeral=True)
-    await inter.response.send_message(
-        f"✅ active as **{me.get('username')}** (enabled={bool(enabled)})",
-        ephemeral=True,
-    )
-
-@bot.tree.command(name="removetoken", description="Delete your saved token")
+@bot.tree.command(name="removetoken", description="Remove your saved token")
 async def removetoken(inter: discord.Interaction):
     await db.remove_token(str(inter.user.id))
-    await inter.response.send_message("🗑️ removed.", ephemeral=True)
+    await inter.response.send_message(embed=E("🗑️ Token Removed", "All traces gone.", C_OK), ephemeral=True)
 
-@bot.tree.command(name="toggle", description="Enable/disable your auto farm")
-async def toggle(inter: discord.Interaction):
-    token, enabled = await db.get_token(str(inter.user.id))
-    if not token:
-        return await inter.response.send_message("❌ no token saved.", ephemeral=True)
-    import aiosqlite
-    async with aiosqlite.connect(db.DB_PATH) as d:
-        await d.execute("UPDATE users SET enabled=? WHERE discord_id=?",
-                        (0 if enabled else 1, str(inter.user.id)))
-        await d.commit()
-    await inter.response.send_message(
-        f"🔁 auto farm {'disabled' if enabled else 'enabled'}.",
-        ephemeral=True,
-    )
+@bot.tree.command(name="start", description="Run a quest pass right now")
+async def start(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    u = await db.get_user(str(inter.user.id))
+    if not u or not u["user_token"]:
+        return await inter.followup.send(embed=E("❌ No Token", "Run `/settoken` first.", C_ERR), ephemeral=True)
+    if str(inter.user.id) in active_tasks:
+        return await inter.followup.send(embed=E("⏳ Already Running", "Wait for the current pass.", C_WAIT), ephemeral=True)
+    await inter.followup.send(embed=E("🚀 Starting Pass", "Harvesting quests...", C_WAIT), ephemeral=True)
+    task = asyncio.create_task(_run_user(str(inter.user.id), u["user_token"], inter))
+    active_tasks[str(inter.user.id)] = task
 
-@bot.tree.command(name="faq", description="How this bot works")
-async def faq(inter: discord.Interaction):
-    await inter.response.send_message(
-        "**quest bot** — farms Discord quests for you.\n"
-        "`/settoken <token>` — save your user token (DM yourself, delete after)\n"
-        "`/runtoken` — run one pass now\n"
-        "`/mytoken` — check status\n"
-        "`/toggle` — enable/disable auto\n"
-        "`/removetoken` — delete it\n\n"
-        "Auto loop every 30 min. Only supports video/play/activity quests. "
-        "This is a **selfbot on your token** — Discord ToS violation, "
-        "burner account recommended. You've been told.",
-        ephemeral=True,
-    )
+@bot.tree.command(name="stop", description="Stop current quest pass")
+async def stop(inter: discord.Interaction):
+    task = active_tasks.get(str(inter.user.id))
+    if not task:
+        return await inter.response.send_message(embed=E("⚠️ Not Running", "No active pass.", C_WAIT), ephemeral=True)
+    task.cancel()
+    await inter.response.send_message(embed=E("🛑 Stop Signal Sent", "Task will halt momentarily.", C_OK), ephemeral=True)
 
-bot.run(BOT_TOKEN)
+@bot.tree.command(name="status", description="Check quest bot status")
+async def status(inter: discord.Interaction):
+    u = await db.get_user(str(inter.user.id))
+    if not u:
+        return await inter.response.send_message(embed=E("❌ No Token", "Run `/settoken` first.", C_ERR), ephemeral=True)
+    state = u["status"] or "idle"
+    color = C_OK if state == "idle" else C_WAIT if state == "running" else C_ERR
+    e = E("📊 Status", color=color)
+    e.add_field(name="State", value=f"**{state.upper()}**", inline=True)
+    e.add_field(name="Last Run", value=f"<t:{u['last_run']}:R>" if u['last_run'] else "Never", inline=True)
+    await inter.response.send_message(embed=e, ephemeral=True)
+
+if __name__ == "__main__":
+    try:
+        bot.run(BOT_TOKEN)
+    finally:
+        asyncio.run(quest_engine.close())
+        asyncio.run(db.close())
