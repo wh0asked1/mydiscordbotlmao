@@ -1,182 +1,237 @@
-import asyncio, json, random, aiohttp
+import asyncio, json, random, re, base64, time, aiohttp
 from datetime import datetime, timezone
+from typing import Optional
 
 API = "https://discord.com/api/v9"
-SUPPORTED = {"WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"}
+HEARTBEAT_INTERVAL = 20
+SUPPORTED_TASKS = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"]
+
+# ── Build number fetcher ───────────────────────────────────────────────────────
+async def fetch_latest_build_number(session: aiohttp.ClientSession) -> int:
+    FALLBACK = 504649
+    try:
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        async with session.get("https://discord.com/app", headers={"User-Agent": ua}, timeout=15) as r:
+            if r.status != 200:
+                return FALLBACK
+            html = await r.text()
+            
+        scripts = re.findall(r'/assets/([a-f0-9]+)\.js', html)
+        if not scripts:
+            scripts_alt = re.findall(r'src="(/assets/[^"]+\.js)"', html)
+            scripts = [s.split('/')[-1].replace('.js', '') for s in scripts_alt]
+
+        if not scripts:
+            return FALLBACK
+
+        for asset_hash in scripts[-5:]:
+            try:
+                async with session.get(f"https://discord.com/assets/{asset_hash}.js", headers={"User-Agent": ua}, timeout=15) as ar:
+                    if ar.status == 200:
+                        text = await ar.text()
+                        m = re.search(r'buildNumber["\s:]+["\s]*(\d{5,7})', text)
+                        if m:
+                            return int(m.group(1))
+            except Exception:
+                continue
+        return FALLBACK
+    except Exception:
+        return FALLBACK
+
+def make_super_properties(build_number: int) -> str:
+    obj = {
+        "os": "Windows", "browser": "Discord Client", "release_channel": "stable",
+        "client_version": "1.0.9175", "os_version": "10.0.26100",
+        "os_arch": "x64", "app_arch": "x64", "system_locale": "en-US",
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9175 Chrome/128.0.6613.186 Electron/32.2.7 Safari/537.36",
+        "browser_version": "32.2.7", "client_build_number": build_number,
+        "native_build_number": 59498, "client_event_source": None,
+    }
+    return base64.b64encode(json.dumps(obj).encode()).decode()
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def _get(d: Optional[dict], *keys):
+    if d is None: return None
+    for k in keys:
+        if k in d: return d[k]
+    return None
+
+def get_task_config(quest: dict) -> Optional[dict]:
+    return _get(quest.get("config", {}), "taskConfig", "task_config", "taskConfigV2", "task_config_v2")
+
+def get_quest_name(quest: dict) -> str:
+    cfg = quest.get("config", {})
+    msgs = cfg.get("messages", {})
+    name = _get(msgs, "questName", "quest_name") or _get(msgs, "gameTitle", "game_title")
+    return (name or cfg.get("application", {}).get("name") or f"Quest#{quest.get('id', '?')}").strip()
+
+def get_task_type(quest: dict) -> Optional[str]:
+    tc = get_task_config(quest)
+    if not tc or "tasks" not in tc: return None
+    for t in SUPPORTED_TASKS:
+        if tc["tasks"].get(t) is not None: return t
+    return None
+
+def get_seconds_needed(quest: dict) -> int:
+    tc, t = get_task_config(quest), get_task_type(quest)
+    return tc["tasks"][t].get("target", 0) if tc and t else 0
+
+def get_seconds_done(quest: dict) -> float:
+    t = get_task_type(quest)
+    if not t: return 0
+    return (quest.get("userStatus") or {}).get("progress", {}).get(t, {}).get("value", 0)
+
+def is_completable(quest: dict) -> bool:
+    exp = _get(quest.get("config", {}), "expiresAt", "expires_at")
+    if exp:
+        try:
+            if datetime.fromisoformat(exp.replace("Z", "+00:00")) <= datetime.now(timezone.utc): return False
+        except: pass
+    return get_task_type(quest) is not None
+
+# ── Engine ─────────────────────────────────────────────────────────────────────
 _session = None
 _session_lock = asyncio.Lock()
-
-def make_headers(token: str):
-    return {
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9189 Chrome/120.0.0.0 Electron/28.2.10 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
 
 async def get_session():
     global _session
     if _session is None or _session.closed:
         async with _session_lock:
             if _session is None or _session.closed:
-                _session = aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300),
-                )
+                _session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300), timeout=aiohttp.ClientTimeout(total=15))
     return _session
 
-async def _api(hdrs, method, path, retries=3, **kw):
-    s = await get_session()
+async def _api(session, hdrs, method, path, payload=None):
     backoff = 1.0
-    for attempt in range(retries):
+    for attempt in range(3):
         try:
-            async with s.request(method, f"{API}{path}", headers=hdrs, **kw) as r:
+            kw = {"json": payload} if payload else {}
+            async with session.request(method, f"{API}{path}", headers=hdrs, **kw) as r:
                 if r.status == 429:
-                    await asyncio.sleep(float((await r.json()).get("retry_after", 5)))
+                    await asyncio.sleep(float((await r.json()).get("retry_after", 5)) + 1)
                     continue
-                if r.status >= 500 and attempt < retries - 1:
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-                    continue
+                if r.status >= 500 and attempt < 2:
+                    await asyncio.sleep(backoff); backoff *= 2; continue
                 txt = await r.text()
-                if r.status >= 400:
-                    return {"error": r.status, "text": txt}
+                if r.status >= 400: return {"error": r.status, "text": txt}
                 return json.loads(txt) if txt else {}
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            if attempt < retries - 1:
-                await asyncio.sleep(backoff)
-                backoff *= 2
-                continue
-            return {"error": str(e)}
+        except Exception as e:
+            if attempt == 2: return {"error": str(e)}
+            await asyncio.sleep(backoff); backoff *= 2
     return {"error": "max_retries"}
 
 async def check_token(token: str):
-    res = await _api(make_headers(token), "GET", "/users/@me")
-    if isinstance(res, dict) and "error" not in res and "username" in res:
-        return res
+    s = await get_session()
+    try:
+        async with s.get(f"{API}/users/@me", headers={"Authorization": token}, timeout=10) as r:
+            if r.status == 200: return await r.json()
+    except: pass
     return None
 
-async def run_pass(token: str, log_callback=None):
-    hdrs = make_headers(token)
+async def run_pass(token: str, log=print):
+    s = await get_session()
     done, errors = [], []
     
-    def _log(msg):
-        if log_callback:
-            log_callback(msg)
+    log("Fetching build number...")
+    build_num = await fetch_latest_build_number(s)
+    log(f"Using build number: {build_num}")
 
-    me = await _api(hdrs, "GET", "/users/@me")
-    if "error" in me:
-        return done, ["Token invalid or network error."]
+    hdrs = {
+        "Authorization": token, "Content-Type": "application/json", "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9175 Chrome/128.0.6613.186 Electron/32.2.7 Safari/537.36",
+        "X-Super-Properties": make_super_properties(build_num),
+        "X-Discord-Locale": "en-US",
+        "X-Discord-Timezone": "Asia/Ho_Chi_Minh",
+        "Origin": "https://discord.com",
+        "Referer": "https://discord.com/channels/@me",
+    }
 
-    _log(f"Logged in as {me.get('username')}")
+    me = await _api(s, hdrs, "GET", "/users/@me")
+    if "error" in me: return done, ["Token invalid"]
 
-    # Fetch quests
-    res = await _api(hdrs, "GET", "/quests/@me")
-    if isinstance(res, dict) and "quests" in res:
-        quests = res["quests"]
+    log(f"Logged in: {me.get('username')}")
+    res = await _api(s, hdrs, "GET", "/quests/@me")
+    
+    if isinstance(res, dict):
+        quests = res.get("quests", [])
+        if res.get("quest_enrollment_blocked_until"):
+            log(f"Enrollment blocked until: {res['quest_enrollment_blocked_until']}")
     elif isinstance(res, list):
         quests = res
     else:
         return done, ["Bad quest response"]
-        
-    now = datetime.now(timezone.utc).timestamp()
 
     for q in quests:
-        if not isinstance(q, dict): continue
+        if not is_completable(q): continue
+        us = q.get("userStatus") or {}
+        if us.get("completedAt"): continue
         
-        user_status = q.get("userStatus") or {}
-        if user_status.get("completedAt"): continue
-        if not user_status.get("enrolledAt"): continue
-        
-        expires_at = q.get("config", {}).get("expiresAt")
-        if expires_at:
-            try:
-                exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
-                if exp < now: continue
-            except Exception:
-                pass
-                
-        cfg = q.get("config", {})
-        task_cfg = cfg.get("taskConfig") or cfg.get("taskConfigV2") or {}
-        tasks = task_cfg.get("tasks") or {}
-        
-        task_name = None
-        for t in SUPPORTED:
-            if t in tasks:
-                task_name = t
-                break
-                
-        if not task_name:
-            continue
-            
+        qname = get_quest_name(q)
         qid = q.get("id")
-        quest_name = cfg.get("messages", {}).get("questName", qid)
-        
-        task_data = tasks[task_name]
-        seconds_needed = task_data.get("target", 0)
-        seconds_done = (user_status.get("progress") or {}).get(task_name, {}).get("value", 0)
-        
-        if seconds_done >= seconds_needed:
-            continue
+        ttype = get_task_type(q)
+        seconds_needed = get_seconds_needed(q)
+        seconds_done = get_seconds_done(q)
 
-        _log(f"Starting {task_name} for {quest_name} ({seconds_done}/{seconds_needed}s)")
+        if not us.get("enrolledAt"):
+            log(f"Enrolling: {qname}")
+            r = await _api(s, hdrs, "POST", f"/quests/{qid}/enroll", payload={
+                "location": 11, "is_targeted": False, "metadata_raw": None, "metadata_sealed": None,
+                "traffic_metadata_raw": q.get("traffic_metadata_raw"), "traffic_metadata_sealed": q.get("traffic_metadata_sealed"),
+            })
+            if "error" in r:
+                log(f"Enroll failed: {r.get('text')}")
+                continue
+            await asyncio.sleep(3)
+            seconds_done = 0
 
-        if task_name in ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE"):
+        if ttype == "WATCH_VIDEO" or ttype == "WATCH_VIDEO_ON_MOBILE":
+            log(f"Video: {qname} ({seconds_done:.0f}/{seconds_needed}s)")
+            enrolled_ts = datetime.fromisoformat(us["enrolledAt"].replace("Z", "+00:00")).timestamp() if us.get("enrolledAt") else time.time()
             speed = 7
-            completed = False
-            while True:
-                if seconds_done >= seconds_needed: break
-                remaining = min(speed, seconds_needed - seconds_done)
-                await asyncio.sleep(remaining)
-                
+            while seconds_done < seconds_needed:
+                max_allowed = (time.time() - enrolled_ts) + 10
+                diff = max_allowed - seconds_done
                 timestamp = seconds_done + speed
-                payload = {"timestamp": min(seconds_needed, timestamp + random.random())}
-                res = await _api(hdrs, "POST", f"/quests/{qid}/video-progress", json=payload)
-                
-                if "error" in res:
-                    _log(f"Video progress error: {res.get('text')}")
-                    break
-                    
-                completed = res.get("completed_at") is not None
-                seconds_done = min(seconds_needed, timestamp)
-                
-                if timestamp >= seconds_needed:
-                    break
+                if diff >= speed:
+                    r = await _api(s, hdrs, "POST", f"/quests/{qid}/video-progress", payload={"timestamp": min(seconds_needed, timestamp + random.random())})
+                    if "error" not in r:
+                        if r.get("completed_at"): break
+                        seconds_done = min(seconds_needed, timestamp)
+                        log(f"  [{qname}] {seconds_done:.0f}/{seconds_needed}s")
+                    elif r.get("error") == 429:
+                        await asyncio.sleep(float(r.get("text", 5)) + 1) # rough
+                if timestamp >= seconds_needed: break
+                await asyncio.sleep(1)
+            await _api(s, hdrs, "POST", f"/quests/{qid}/video-progress", payload={"timestamp": seconds_needed})
 
-            if not completed:
-                await _api(hdrs, "POST", f"/quests/{qid}/video-progress", json={"timestamp": seconds_needed})
-                
-        elif task_name == "PLAY_ACTIVITY":
-            # Need a stream key, faking a voice channel one
-            channel_id = str(random.randint(10**17, 10**18))
-            stream_key = f"call:{channel_id}:1"
-            
-            while True:
-                payload = {"stream_key": stream_key, "terminal": False}
-                res = await _api(hdrs, "POST", f"/quests/{qid}/heartbeat", json=payload)
-                
-                if "error" in res:
-                    _log(f"Heartbeat error: {res.get('text')}")
-                    break
-                    
-                progress = res.get("progress", {}).get("PLAY_ACTIVITY", {}).get("value", 0)
-                _log(f"Quest progress: {progress}/{seconds_needed}")
-                
-                await asyncio.sleep(20)
-                
-                if progress >= seconds_needed:
-                    await _api(hdrs, "POST", f"/quests/{qid}/heartbeat", json={"stream_key": stream_key, "terminal": True})
-                    break
-                    
-        else:
-            # PLAY_ON_DESKTOP / STREAM_ON_DESKTOP needs a real desktop client
-            # We can't spoof the game process from a headless bot easily via API
-            _log(f"Skipping {task_name} (requires desktop client)")
-            continue
+        elif ttype == "PLAY_ACTIVITY":
+            log(f"Activity: {qname} ({seconds_done:.0f}/{seconds_needed}s)")
+            stream_key = "call:0:1"
+            while seconds_done < seconds_needed:
+                r = await _api(s, hdrs, "POST", f"/quests/{qid}/heartbeat", payload={"stream_key": stream_key, "terminal": False})
+                if "error" not in r:
+                    seconds_done = r.get("progress", {}).get("PLAY_ACTIVITY", {}).get("value", seconds_done)
+                    log(f"  [{qname}] {seconds_done:.0f}/{seconds_needed}s")
+                    if r.get("completed_at") or seconds_done >= seconds_needed: break
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await _api(s, hdrs, "POST", f"/quests/{qid}/heartbeat", payload={"stream_key": stream_key, "terminal": True})
 
-        done.append(quest_name)
-        _log(f"Completed {quest_name}")
+        elif ttype in ("PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP"):
+            log(f"Desktop: {qname} ({seconds_done:.0f}/{seconds_needed}s)")
+            pid = random.randint(1000, 30000)
+            while seconds_done < seconds_needed:
+                r = await _api(s, hdrs, "POST", f"/quests/{qid}/heartbeat", payload={"stream_key": f"call:0:{pid}", "terminal": False})
+                if "error" not in r:
+                    pd = r.get("progress", {})
+                    if ttype in pd: seconds_done = pd[ttype].get("value", seconds_done)
+                    log(f"  [{qname}] {seconds_done:.0f}/{seconds_needed}s")
+                    if r.get("completed_at") or seconds_done >= seconds_needed: break
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await _api(s, hdrs, "POST", f"/quests/{qid}/heartbeat", payload={"stream_key": f"call:0:{pid}", "terminal": True})
+
+        done.append(qname)
+        log(f"Completed: {qname}")
         await asyncio.sleep(2)
 
     return done, errors
