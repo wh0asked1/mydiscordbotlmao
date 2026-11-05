@@ -11,6 +11,7 @@ log = logging.getLogger("questbot")
 
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
 active_tasks = {}
+user_logs = {} # Stores latest progress text for /status
 
 C_OK = discord.Color.green()
 C_ERR = discord.Color.red()
@@ -25,45 +26,29 @@ def E(title, desc="", color=C_INFO, footer=None):
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user}")
-    try:
-        await db.init()
-        await bot.tree.sync()
-        log.info("Synced commands")
-    except Exception as e:
-        log.error(f"Startup DB/Sync error: {e}")
-
-    # THE FIX: Guard against multiple on_ready calls
+    await db.init()
+    await bot.tree.sync()
     if not auto_loop.is_running():
         auto_loop.start()
-        log.info("Started auto loop")
 
-async def _run_user(discord_id: str, token: str, inter=None):
+async def _run_user(discord_id: str, token: str, update_cb=None):
     await db.set_status(discord_id, "running", int(time.time()))
     try:
-        done, errors = await quest_engine.run_pass(token)
+        done, errors = await quest_engine.run_pass(token, update_cb=update_cb)
         if errors:
             await db.set_status(discord_id, "error", int(time.time()))
-            if inter:
-                desc = "\n".join(f"❌ {e}" for e in errors)
-                if done: desc += "\n\n" + "\n".join(f"✅ {d}" for d in done)
-                await inter.followup.send(embed=E("⚠️ Partial Pass", desc, C_ERR), ephemeral=True)
+            if update_cb: await update_cb(f"❌ Errors: {', '.join(errors)}", "error")
         else:
             await db.set_status(discord_id, "idle", int(time.time()))
-            if inter:
-                desc = "\n".join(f"✅ {d}" for d in done) if done else "Nothing new to claim."
-                await inter.followup.send(embed=E("✅ Pass Complete", desc, C_OK), ephemeral=True)
+            if update_cb: await update_cb(f"✅ Pass Complete. Claimed {len(done)} quests.", "ok")
     except asyncio.CancelledError:
         await db.set_status(discord_id, "idle")
-        if inter:
-            try: await inter.followup.send(embed=E("🛑 Stopped", "Pass cancelled by user.", C_WAIT), ephemeral=True)
-            except Exception: pass
+        if update_cb: await update_cb("🛑 Stopped by user.", "warn")
         raise
     except Exception as e:
         log.exception(e)
         await db.set_status(discord_id, "error", int(time.time()))
-        if inter:
-            try: await inter.followup.send(embed=E("❌ Crash", str(e), C_ERR), ephemeral=True)
-            except Exception: pass
+        if update_cb: await update_cb(f"❌ Crash: {str(e)}", "error")
     finally:
         active_tasks.pop(discord_id, None)
 
@@ -77,7 +62,11 @@ async def auto_loop():
             u = await db.get_user(discord_id)
             if u and u["status"] == "running": return
             await asyncio.sleep(random.uniform(1, 10))
-            active_tasks[discord_id] = asyncio.create_task(_run_user(discord_id, token))
+            
+            async def cb(text, level="info"):
+                user_logs[discord_id] = text
+                
+            active_tasks[discord_id] = asyncio.create_task(_run_user(discord_id, token, cb))
     await asyncio.gather(*(_one(d, t) for d, t in rows), return_exceptions=True)
 
 @bot.tree.command(name="ping", description="Check bot latency")
@@ -120,8 +109,24 @@ async def start(inter: discord.Interaction):
         return await inter.followup.send(embed=E("❌ No Token", "Run `/settoken` first.", C_ERR), ephemeral=True)
     if str(inter.user.id) in active_tasks:
         return await inter.followup.send(embed=E("⏳ Already Running", "Wait for the current pass.", C_WAIT), ephemeral=True)
-    await inter.followup.send(embed=E("🚀 Starting Pass", "Harvesting quests...", C_WAIT), ephemeral=True)
-    active_tasks[str(inter.user.id)] = asyncio.create_task(_run_user(str(inter.user.id), u["user_token"], inter))
+
+    embed = E("🚀 Starting Pass", "Initializing...", C_WAIT)
+    msg = await inter.followup.send(embed=embed, ephemeral=True)
+
+    async def update_cb(text, level="info"):
+        user_logs[str(inter.user.id)] = text
+        nonlocal embed
+        embed.description = text
+        if level == "error": embed.color = C_ERR
+        elif level == "ok": embed.color = C_OK
+        elif level == "warn": embed.color = C_WAIT
+        else: embed.color = C_INFO
+        try:
+            await msg.edit(embed=embed)
+        except Exception:
+            pass
+
+    active_tasks[str(inter.user.id)] = asyncio.create_task(_run_user(str(inter.user.id), u["user_token"], update_cb))
 
 @bot.tree.command(name="stop", description="Stop current quest pass")
 async def stop(inter: discord.Interaction):
@@ -131,16 +136,22 @@ async def stop(inter: discord.Interaction):
     task.cancel()
     await inter.response.send_message(embed=E("🛑 Stop Signal Sent", "Task will halt momentarily.", C_OK), ephemeral=True)
 
-@bot.tree.command(name="status", description="Check quest bot status")
+@bot.tree.command(name="status", description="Check live quest bot status")
 async def status(inter: discord.Interaction):
     u = await db.get_user(str(inter.user.id))
     if not u:
         return await inter.response.send_message(embed=E("❌ No Token", "Run `/settoken` first.", C_ERR), ephemeral=True)
+    
     state = u["status"] or "idle"
     color = C_OK if state == "idle" else C_WAIT if state == "running" else C_ERR
     e = E("📊 Status", color=color)
     e.add_field(name="State", value=f"**{state.upper()}**", inline=True)
     e.add_field(name="Last Run", value=f"<t:{u['last_run']}:R>" if u['last_run'] else "Never", inline=True)
+    
+    if state == "running":
+        latest_log = user_logs.get(str(inter.user.id), "Starting engine...")
+        e.add_field(name="Live Progress", value=f"```{latest_log}```", inline=False)
+        
     await inter.response.send_message(embed=e, ephemeral=True)
 
 if __name__ == "__main__":
