@@ -6,12 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install requirements (check build logs to ensure this runs!)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the source
 COPY . .
 
-# Run the bot
-CMD ["python", "-m", "questbot.bot"]
+CMD ["python", "bot.py"]
