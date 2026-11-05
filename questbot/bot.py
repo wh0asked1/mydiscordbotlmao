@@ -1,17 +1,23 @@
-import os, asyncio, logging, time, random
+import os
+import asyncio
+import logging
+import time
+import random
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-import db, quest_engine
+import db
+import quest_engine
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("questbot")
 
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
 active_tasks = {}
-user_logs = {} # Stores latest progress text for /status
+user_logs = {}
 
 C_OK = discord.Color.green()
 C_ERR = discord.Color.red()
@@ -20,14 +26,20 @@ C_WAIT = discord.Color.gold()
 
 def E(title, desc="", color=C_INFO, footer=None):
     e = discord.Embed(title=title, description=desc, color=color, timestamp=discord.utils.utcnow())
-    if footer: e.set_footer(text=footer)
+    if footer:
+        e.set_footer(text=footer)
     return e
 
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user}")
     await db.init()
-    await bot.tree.sync()
+    try:
+        await bot.tree.sync()
+        log.info("Slash commands synced.")
+    except Exception as e:
+        log.error(f"Sync error: {e}")
+        
     if not auto_loop.is_running():
         auto_loop.start()
 
@@ -37,18 +49,22 @@ async def _run_user(discord_id: str, token: str, update_cb=None):
         done, errors = await quest_engine.run_pass(token, update_cb=update_cb)
         if errors:
             await db.set_status(discord_id, "error", int(time.time()))
-            if update_cb: await update_cb(f"❌ Errors: {', '.join(errors)}", "error")
+            if update_cb:
+                await update_cb(f"❌ Errors: {', '.join(errors)}", "error")
         else:
             await db.set_status(discord_id, "idle", int(time.time()))
-            if update_cb: await update_cb(f"✅ Pass Complete. Claimed {len(done)} quests.", "ok")
+            if update_cb:
+                await update_cb(f"✅ Pass Complete. Claimed {len(done)} quests.", "ok")
     except asyncio.CancelledError:
         await db.set_status(discord_id, "idle")
-        if update_cb: await update_cb("🛑 Stopped by user.", "warn")
+        if update_cb:
+            await update_cb("🛑 Stopped by user.", "warn")
         raise
     except Exception as e:
         log.exception(e)
         await db.set_status(discord_id, "error", int(time.time()))
-        if update_cb: await update_cb(f"❌ Crash: {str(e)}", "error")
+        if update_cb:
+            await update_cb(f"❌ Crash: {str(e)}", "error")
     finally:
         active_tasks.pop(discord_id, None)
 
@@ -56,17 +72,21 @@ async def _run_user(discord_id: str, token: str, update_cb=None):
 async def auto_loop():
     sem = asyncio.Semaphore(3)
     rows = await db.all_enabled()
+    
     async def _one(discord_id, token):
         async with sem:
-            if discord_id in active_tasks: return
+            if discord_id in active_tasks:
+                return
             u = await db.get_user(discord_id)
-            if u and u["status"] == "running": return
+            if u and u["status"] == "running":
+                return
             await asyncio.sleep(random.uniform(1, 10))
             
             async def cb(text, level="info"):
                 user_logs[discord_id] = text
                 
             active_tasks[discord_id] = asyncio.create_task(_run_user(discord_id, token, cb))
+            
     await asyncio.gather(*(_one(d, t) for d, t in rows), return_exceptions=True)
 
 @bot.tree.command(name="ping", description="Check bot latency")
@@ -117,10 +137,14 @@ async def start(inter: discord.Interaction):
         user_logs[str(inter.user.id)] = text
         nonlocal embed
         embed.description = text
-        if level == "error": embed.color = C_ERR
-        elif level == "ok": embed.color = C_OK
-        elif level == "warn": embed.color = C_WAIT
-        else: embed.color = C_INFO
+        if level == "error":
+            embed.color = C_ERR
+        elif level == "ok":
+            embed.color = C_OK
+        elif level == "warn":
+            embed.color = C_WAIT
+        else:
+            embed.color = C_INFO
         try:
             await msg.edit(embed=embed)
         except Exception:
