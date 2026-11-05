@@ -1,5 +1,6 @@
 #!/bin/bash
-echo "Installing dependencies at runtime..."
-pip install --no-cache-dir discord.py aiohttp aiosqlite python-dotenv
+set -e
+echo "Installing dependencies..."
+python -m pip install --no-cache-dir -r requirements.txt
 echo "Starting bot..."
-python bot.py
+exec python bot.py
