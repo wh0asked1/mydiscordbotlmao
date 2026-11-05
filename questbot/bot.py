@@ -9,8 +9,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("questbot")
 
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
 active_tasks = {}
 
 C_OK = discord.Color.green()
@@ -25,10 +24,18 @@ def E(title, desc="", color=C_INFO, footer=None):
 
 @bot.event
 async def on_ready():
-    await db.init()
-    await bot.tree.sync()
-    log.info(f"logged in as {bot.user}")
-    auto_loop.start()
+    log.info(f"Logged in as {bot.user}")
+    try:
+        await db.init()
+        await bot.tree.sync()
+        log.info("Synced commands")
+    except Exception as e:
+        log.error(f"Startup DB/Sync error: {e}")
+
+    # THE FIX: Guard against multiple on_ready calls
+    if not auto_loop.is_running():
+        auto_loop.start()
+        log.info("Started auto loop")
 
 async def _run_user(discord_id: str, token: str, inter=None):
     await db.set_status(discord_id, "running", int(time.time()))
@@ -70,15 +77,8 @@ async def auto_loop():
             u = await db.get_user(discord_id)
             if u and u["status"] == "running": return
             await asyncio.sleep(random.uniform(1, 10))
-            task = asyncio.create_task(_run_user(discord_id, token))
-            active_tasks[discord_id] = task
+            active_tasks[discord_id] = asyncio.create_task(_run_user(discord_id, token))
     await asyncio.gather(*(_one(d, t) for d, t in rows), return_exceptions=True)
-
-@auto_loop.before_loop
-async def before():
-    await bot.wait_until_ready()
-
-# --- Commands ---
 
 @bot.tree.command(name="ping", description="Check bot latency")
 async def ping(inter: discord.Interaction):
@@ -121,8 +121,7 @@ async def start(inter: discord.Interaction):
     if str(inter.user.id) in active_tasks:
         return await inter.followup.send(embed=E("⏳ Already Running", "Wait for the current pass.", C_WAIT), ephemeral=True)
     await inter.followup.send(embed=E("🚀 Starting Pass", "Harvesting quests...", C_WAIT), ephemeral=True)
-    task = asyncio.create_task(_run_user(str(inter.user.id), u["user_token"], inter))
-    active_tasks[str(inter.user.id)] = task
+    active_tasks[str(inter.user.id)] = asyncio.create_task(_run_user(str(inter.user.id), u["user_token"], inter))
 
 @bot.tree.command(name="stop", description="Stop current quest pass")
 async def stop(inter: discord.Interaction):
@@ -145,8 +144,4 @@ async def status(inter: discord.Interaction):
     await inter.response.send_message(embed=e, ephemeral=True)
 
 if __name__ == "__main__":
-    try:
-        bot.run(BOT_TOKEN)
-    finally:
-        asyncio.run(quest_engine.close())
-        asyncio.run(db.close())
+    bot.run(BOT_TOKEN)
