@@ -6,12 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 1. install requirements first (cached layer)
-COPY requirements.txt ./
+# Install requirements (check build logs to ensure this runs!)
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 2. copy source (adjust paths if your bot is in a folder)
+# Copy the source
 COPY . .
 
-# 3. run directly (no entrypoint script needed)
+# Run the bot
 CMD ["python", "-m", "questbot.bot"]
