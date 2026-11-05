@@ -1,27 +1,17 @@
-FROM python:3.11-slim AS base
+FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# install uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && mv /root/.local/bin/uv /usr/local/bin/uv
-
 WORKDIR /app
 
-# copy manifests first for cache
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+# 1. install requirements first (cached layer)
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# now the source
-COPY questbot ./questbot
-RUN uv sync --frozen --no-dev
+# 2. copy source (adjust paths if your bot is in a folder)
+COPY . .
 
-ENV PATH="/app/.venv/bin:${PATH}"
-
-CMD ["questbot"]
+# 3. run directly (no entrypoint script needed)
+CMD ["python", "-m", "questbot.bot"]
