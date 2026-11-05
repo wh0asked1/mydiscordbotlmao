@@ -1,7 +1,8 @@
-import asyncio, json, base64, random, aiohttp
+import asyncio, json, random, aiohttp
+from datetime import datetime, timezone
 
 API = "https://discord.com/api/v9"
-SUPPORTED = {"WATCH_VIDEO", "PLAY_ON_DESKTOP", "WATCH_VIDEO_ON_MOBILE", "PLAY_ACTIVITY"}
+SUPPORTED = {"WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"}
 _session = None
 _session_lock = asyncio.Lock()
 
@@ -10,11 +11,8 @@ def make_headers(token: str):
         "Authorization": token,
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9189 Chrome/120.0.0.0 Electron/28.2.10 Safari/537.36",
-        "X-Super-Properties": base64.b64encode(json.dumps({
-            "os": "Windows", "browser": "Discord Client", "device": "",
-            "system_locale": "en-US", "client_version": "1.0.9189",
-            "release_channel": "stable", "client_build_number": 0,
-        }).encode()).decode(),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
 async def get_session():
@@ -59,38 +57,126 @@ async def check_token(token: str):
         return res
     return None
 
-async def run_pass(token: str):
+async def run_pass(token: str, log_callback=None):
     hdrs = make_headers(token)
     done, errors = [], []
+    
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
+
     me = await _api(hdrs, "GET", "/users/@me")
     if "error" in me:
         return done, ["Token invalid or network error."]
 
-    quests = await _api(hdrs, "GET", "/quests/@me")
-    if not isinstance(quests, list):
-        err = quests.get("message", "Bad quest response") if isinstance(quests, dict) else "Bad quest response"
-        return done, [err]
+    _log(f"Logged in as {me.get('username')}")
+
+    # Fetch quests
+    res = await _api(hdrs, "GET", "/quests/@me")
+    if isinstance(res, dict) and "quests" in res:
+        quests = res["quests"]
+    elif isinstance(res, list):
+        quests = res
+    else:
+        return done, ["Bad quest response"]
+        
+    now = datetime.now(timezone.utc).timestamp()
 
     for q in quests:
         if not isinstance(q, dict): continue
-        if (q.get("user_status") or {}).get("completed_at"): continue
+        
+        user_status = q.get("userStatus") or {}
+        if user_status.get("completedAt"): continue
+        if not user_status.get("enrolledAt"): continue
+        
+        expires_at = q.get("config", {}).get("expiresAt")
+        if expires_at:
+            try:
+                exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+                if exp < now: continue
+            except Exception:
+                pass
+                
         cfg = q.get("config", {})
-        task = cfg.get("task_config") or cfg.get("taskConfig") or {}
-        ttype = (task.get("task_type") or task.get("taskType") or "").upper()
-        if ttype not in SUPPORTED: continue
+        task_cfg = cfg.get("taskConfig") or cfg.get("taskConfigV2") or {}
+        tasks = task_cfg.get("tasks") or {}
+        
+        task_name = None
+        for t in SUPPORTED:
+            if t in tasks:
+                task_name = t
+                break
+                
+        if not task_name:
+            continue
+            
         qid = q.get("id")
-        if not qid: continue
+        quest_name = cfg.get("messages", {}).get("questName", qid)
+        
+        task_data = tasks[task_name]
+        seconds_needed = task_data.get("target", 0)
+        seconds_done = (user_status.get("progress") or {}).get(task_name, {}).get("value", 0)
+        
+        if seconds_done >= seconds_needed:
+            continue
 
-        await _api(hdrs, "POST", f"/quests/{qid}/enroll")
-        await asyncio.sleep(random.uniform(0.8, 2.0))
-        payload = {"quest_id": qid}
-        payload["stream_progress" if ttype == "WATCH_VIDEO" else "play_progress"] = 100
-        await _api(hdrs, "POST", f"/quests/{qid}/progress", json=payload)
-        await asyncio.sleep(random.uniform(1.0, 2.5))
-        claim = await _api(hdrs, "POST", f"/quests/{qid}/claim")
-        if "error" in claim:
-            errors.append(f"Failed to claim {q.get('name', qid)}")
+        _log(f"Starting {task_name} for {quest_name} ({seconds_done}/{seconds_needed}s)")
+
+        if task_name in ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE"):
+            speed = 7
+            completed = False
+            while True:
+                if seconds_done >= seconds_needed: break
+                remaining = min(speed, seconds_needed - seconds_done)
+                await asyncio.sleep(remaining)
+                
+                timestamp = seconds_done + speed
+                payload = {"timestamp": min(seconds_needed, timestamp + random.random())}
+                res = await _api(hdrs, "POST", f"/quests/{qid}/video-progress", json=payload)
+                
+                if "error" in res:
+                    _log(f"Video progress error: {res.get('text')}")
+                    break
+                    
+                completed = res.get("completed_at") is not None
+                seconds_done = min(seconds_needed, timestamp)
+                
+                if timestamp >= seconds_needed:
+                    break
+
+            if not completed:
+                await _api(hdrs, "POST", f"/quests/{qid}/video-progress", json={"timestamp": seconds_needed})
+                
+        elif task_name == "PLAY_ACTIVITY":
+            # Need a stream key, faking a voice channel one
+            channel_id = str(random.randint(10**17, 10**18))
+            stream_key = f"call:{channel_id}:1"
+            
+            while True:
+                payload = {"stream_key": stream_key, "terminal": False}
+                res = await _api(hdrs, "POST", f"/quests/{qid}/heartbeat", json=payload)
+                
+                if "error" in res:
+                    _log(f"Heartbeat error: {res.get('text')}")
+                    break
+                    
+                progress = res.get("progress", {}).get("PLAY_ACTIVITY", {}).get("value", 0)
+                _log(f"Quest progress: {progress}/{seconds_needed}")
+                
+                await asyncio.sleep(20)
+                
+                if progress >= seconds_needed:
+                    await _api(hdrs, "POST", f"/quests/{qid}/heartbeat", json={"stream_key": stream_key, "terminal": True})
+                    break
+                    
         else:
-            done.append(q.get("name", qid))
-        await asyncio.sleep(random.uniform(2, 4))
+            # PLAY_ON_DESKTOP / STREAM_ON_DESKTOP needs a real desktop client
+            # We can't spoof the game process from a headless bot easily via API
+            _log(f"Skipping {task_name} (requires desktop client)")
+            continue
+
+        done.append(quest_name)
+        _log(f"Completed {quest_name}")
+        await asyncio.sleep(2)
+
     return done, errors
