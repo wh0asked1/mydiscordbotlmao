@@ -122,19 +122,32 @@ async def _api(session, hdrs, method, path, payload=None):
                     await asyncio.sleep(retry + 1)
                     continue
                 if r.status >= 500 and attempt < 2:
-                    await asyncio.sleep(backoff); backoff *= 2; continue
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
                 if r.status >= 400:
                     return {"error": r.status, "text": txt}
                 return json.loads(txt) if txt else {}
         except Exception as e:
             if attempt == 2: return {"error": str(e)}
-            await asyncio.sleep(backoff); backoff *= 2
+            await asyncio.sleep(backoff)
+            backoff *= 2
     return {"error": "max_retries"}
+
+async def check_token(token: str):
+    s = await get_session()
+    try:
+        async with s.get(f"{API}/users/@me", headers={"Authorization": token}, timeout=10) as r:
+            if r.status == 200: return await r.json()
+    except: pass
+    return None
 
 async def run_pass(token: str, update_cb=None):
     async def log(msg, level="info"):
-        if update_cb: await update_cb(msg, level)
-        else: print(f"[{level.upper()}] {msg}")
+        if update_cb:
+            await update_cb(msg, level)
+        else:
+            print(f"[{level.upper()}] {msg}")
 
     s = await get_session()
     done, errors = [], []
@@ -220,6 +233,44 @@ async def run_pass(token: str, update_cb=None):
             await _api(s, hdrs, "POST", f"/quests/{qid}/video-progress", payload={"timestamp": seconds_needed})
             done.append(name)
             await log(f"✅ Completed: {name}", "ok")
+
+        elif task_type in ("PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP"):
+            await log(f"🎮 {task_type}: {name} ({seconds_done:.0f}/{seconds_needed}s)", "info")
+            pid = random.randint(1000, 30000)
+            while seconds_done < seconds_needed:
+                r = await _api(s, hdrs, "POST", f"/quests/{qid}/heartbeat", payload={"stream_key": f"call:0:{pid}", "terminal": False})
+                if "error" not in r:
+                    pd = r.get("progress", {})
+                    if pd and task_type in pd: seconds_done = pd[task_type].get("value", seconds_done)
+                    await log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
+                    if r.get("completed_at") or seconds_done >= seconds_needed: break
+                elif r.get("error") == 429:
+                    await asyncio.sleep(float(r.get("text", 5)) + 1)
+                    continue
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await _api(s, hdrs, "POST", f"/quests/{qid}/heartbeat", payload={"stream_key": f"call:0:{pid}", "terminal": True})
+            done.append(name)
+            await log(f"✅ Completed: {name}", "ok")
+
+        elif task_type == "PLAY_ACTIVITY":
+            await log(f"🕹️ Activity: {name} ({seconds_done:.0f}/{seconds_needed}s)", "info")
+            stream_key = "call:0:1"
+            while seconds_done < seconds_needed:
+                r = await _api(s, hdrs, "POST", f"/quests/{qid}/heartbeat", payload={"stream_key": stream_key, "terminal": False})
+                if "error" not in r:
+                    pd = r.get("progress", {})
+                    if pd and "PLAY_ACTIVITY" in pd: seconds_done = pd["PLAY_ACTIVITY"].get("value", seconds_done)
+                    await log(f"  [{name}] {seconds_done:.0f}/{seconds_needed}s", "progress")
+                    if r.get("completed_at") or seconds_done >= seconds_needed: break
+                elif r.get("error") == 429:
+                    await asyncio.sleep(float(r.get("text", 5)) + 1)
+                    continue
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await _api(s, hdrs, "POST", f"/quests/{qid}/heartbeat", payload={"stream_key": stream_key, "terminal": True})
+            done.append(name)
+            await log(f"✅ Completed: {name}", "ok")
+
+    return done, errors)
 
         elif task_type in ("PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP"):
             await log(f"🎮 {task_type}: {name} ({seconds_done:.0f}/{seconds_needed}s)", "info")
